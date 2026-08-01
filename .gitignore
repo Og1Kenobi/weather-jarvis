@@ -1,0 +1,40 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# build
+dist/
+.output/
+.vinxi/
+.nitro/
+.vercel/
+.tanstack/
+*.local
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# logs / OS
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+*.log
+/tmp/
+
+# editor
+.idea/
+.vscode/
+*.swp
+
+# agent QA / local artifacts
+screenshots/
+artifacts/
+.grok/
+vendor/
+
+# typescript
+*.tsbuildinfo
