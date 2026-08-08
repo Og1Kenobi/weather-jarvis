@@ -134,13 +134,14 @@ export function WeatherJarvisApp() {
 
   /** Must run inside a click/tap — unlocks browser audio + TTS. */
   const enableMedia = useCallback(async (): Promise<boolean> => {
-    unlockSpeech();
     warmVoices();
-    const ok = await unlockAudio();
-    mediaReadyRef.current = ok || isAudioUnlocked();
+    const audioOk = await unlockAudio();
+    // Chrome needs a real speak() during the gesture — await the short unlock phrase
+    const speechOk = await unlockSpeech();
+    mediaReadyRef.current = audioOk || isAudioUnlocked() || speechOk;
     setMediaReady(mediaReadyRef.current);
     if (!mediaReadyRef.current) {
-      toast.error("Could not enable sound. Unmute the tab and try again.");
+      toast.error("Could not enable sound in Chrome. Unmute the tab and try again.");
     }
     return mediaReadyRef.current;
   }, []);
@@ -198,11 +199,25 @@ export function WeatherJarvisApp() {
       setAnnouncing(true);
       try {
         await unlockAudio();
-        unlockSpeech();
+        // Don't re-run full unlockSpeech phrase mid-broadcast (avoids cancel races in Chrome)
         warmVoices();
 
         const doSound = opts?.forceSound ?? soundOn;
         const doVoice = opts?.forceVoice ?? voiceOn;
+
+        // Chrome: speak a short attention line FIRST (keeps speech engine alive),
+        // then EAS tone, then full bulletin. Edge is fine either way.
+        if (doVoice && canSpeak() && severe[0]) {
+          try {
+            setBroadcastPhase("voice");
+            await speak(
+              `Attention. ${severe[0].event}. Stand by for the full weather bulletin.`,
+              { immediate: true, rate: 1 },
+            );
+          } catch {
+            /* continue to tone; full read may still work */
+          }
+        }
 
         if (doSound) {
           setBroadcastPhase("tone");
@@ -227,7 +242,7 @@ export function WeatherJarvisApp() {
               announcedRef.current.add(alert.id);
             } catch (err) {
               console.warn("[jarvis] speech failed", err);
-              toast.error("Could not read alert. Unmute the tab, then tap Play again.");
+              toast.error("Chrome blocked speech. Unmute the tab, then tap Play again.");
               break;
             }
           }
@@ -569,7 +584,7 @@ export function WeatherJarvisApp() {
                   <p className="text-xs leading-relaxed text-muted sm:text-sm">
                     {mediaReady
                       ? "Sound is enabled. New high-impact alerts will tone + read when Auto-announce is on."
-                      : "Browsers block alarm sound until you tap. Unmute the tab, then press Play."}
+                      : "Chrome blocks sound until you tap. Unmute this tab, then press Play (works after one tap)."}
                   </p>
                   <Button
                     size="sm"
