@@ -31,6 +31,23 @@ export type WeatherCode =
 
 export type AlertSeverity = "extreme" | "severe" | "moderate" | "minor" | "unknown";
 
+/** Product family for toggles / filtering */
+export type AlertKind =
+  | "tornado"
+  | "severeStorm"
+  | "flood"
+  | "heat"
+  | "cold"
+  | "wind"
+  | "fire"
+  | "tropical"
+  | "winter"
+  | "watch"
+  | "advisory"
+  | "other";
+
+export type AlertScope = "local" | "office";
+
 export interface GeoLocation {
   lat: number;
   lon: number;
@@ -98,8 +115,14 @@ export interface WeatherAlert {
   certainty: string;
   onset?: string;
   ends?: string;
-  source: "nws" | "jarvis" | "demo";
+  source: "nws" | "jarvis";
   area?: string;
+  /** tornado, flood, heat, fire, … */
+  kind: AlertKind;
+  /** local = covers your point; office = active in your NWS forecast office area */
+  scope: AlertScope;
+  /** e.g. PAH */
+  office?: string;
 }
 
 export type Units = "imperial" | "metric";
