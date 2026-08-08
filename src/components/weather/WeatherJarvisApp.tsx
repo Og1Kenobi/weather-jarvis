@@ -132,18 +132,39 @@ export function WeatherJarvisApp() {
     saveAlertKindPrefs(kindPrefs);
   }, [kindPrefs]);
 
-  /** Must run inside a click/tap — unlocks browser audio + TTS. */
+  /**
+   * One silent arm from any click/key — no special button required.
+   * Browser autoplay policy still needs one gesture per page load.
+   */
+  useEffect(() => {
+    let armed = mediaReadyRef.current;
+    const arm = () => {
+      if (armed) return;
+      armed = true;
+      unlockSpeech();
+      void unlockAudio().then((ok) => {
+        mediaReadyRef.current = ok || isAudioUnlocked() || canSpeak();
+        setMediaReady(mediaReadyRef.current);
+      });
+      // Always mark ready after gesture — sticky activation is enough for speech
+      mediaReadyRef.current = true;
+      setMediaReady(true);
+    };
+    window.addEventListener("pointerdown", arm, { capture: true });
+    window.addEventListener("keydown", arm, { capture: true });
+    return () => {
+      window.removeEventListener("pointerdown", arm, { capture: true } as EventListenerOptions);
+      window.removeEventListener("keydown", arm, { capture: true } as EventListenerOptions);
+    };
+  }, []);
+
   const enableMedia = useCallback(async (): Promise<boolean> => {
     warmVoices();
-    const audioOk = await unlockAudio();
-    // Chrome needs a real speak() during the gesture — await the short unlock phrase
-    const speechOk = await unlockSpeech();
-    mediaReadyRef.current = audioOk || isAudioUnlocked() || speechOk;
-    setMediaReady(mediaReadyRef.current);
-    if (!mediaReadyRef.current) {
-      toast.error("Could not enable sound in Chrome. Unmute the tab and try again.");
-    }
-    return mediaReadyRef.current;
+    unlockSpeech();
+    const ok = await unlockAudio();
+    mediaReadyRef.current = true;
+    setMediaReady(true);
+    return ok || isAudioUnlocked() || canSpeak();
   }, []);
 
   const visibleAlerts = useMemo(
@@ -183,53 +204,33 @@ export function WeatherJarvisApp() {
   const broadcastAlerts = useCallback(
     async (
       list: WeatherAlert[],
-      opts?: { forceSound?: boolean; forceVoice?: boolean; requireMedia?: boolean },
+      opts?: { forceSound?: boolean; forceVoice?: boolean; fromUser?: boolean },
     ) => {
       if (announceLock.current) return;
       const prefs = kindPrefsRef.current;
       const severe = list.filter((a) => isSevere(a) && isKindEnabled(a, prefs));
       if (severe.length === 0) return;
 
-      // Browsers block tone/voice until a user gesture
-      if (opts?.requireMedia !== false && !mediaReadyRef.current && !isAudioUnlocked()) {
-        return;
-      }
+      // Wait for first page gesture unless user pressed Play / Read
+      if (!opts?.fromUser && !mediaReadyRef.current) return;
 
       announceLock.current = true;
       setAnnouncing(true);
       try {
         await unlockAudio();
-        // Don't re-run full unlockSpeech phrase mid-broadcast (avoids cancel races in Chrome)
+        unlockSpeech();
         warmVoices();
 
         const doSound = opts?.forceSound ?? soundOn;
         const doVoice = opts?.forceVoice ?? voiceOn;
 
-        // Chrome: speak a short attention line FIRST (keeps speech engine alive),
-        // then EAS tone, then full bulletin. Edge is fine either way.
-        if (doVoice && canSpeak() && severe[0]) {
-          try {
-            setBroadcastPhase("voice");
-            await speak(
-              `Attention. ${severe[0].event}. Stand by for the full weather bulletin.`,
-              { immediate: true, rate: 1 },
-            );
-          } catch {
-            /* continue to tone; full read may still work */
-          }
-        }
-
         if (doSound) {
           setBroadcastPhase("tone");
           try {
-            const top = severe[0]!;
-            await playAlertSound(soundLevelFor(top));
+            await playAlertSound(soundLevelFor(severe[0]!));
           } catch (err) {
             console.warn("[jarvis] tone failed", err);
-            toast.error("Alert tone blocked. Tap “Play tone & read” once to enable sound.");
-            setMediaReady(false);
-            mediaReadyRef.current = false;
-            return;
+            // Don't hard-fail the whole broadcast — still try voice
           }
         }
 
@@ -238,19 +239,24 @@ export function WeatherJarvisApp() {
           for (const alert of severe) {
             setSpeakingId(alert.id);
             try {
-              await speak(alertSpeechScript(alert), { immediate: true });
+              await speak(alertSpeechScript(alert));
               announcedRef.current.add(alert.id);
             } catch (err) {
               console.warn("[jarvis] speech failed", err);
-              toast.error("Chrome blocked speech. Unmute the tab, then tap Play again.");
-              break;
+              // Retry once after re-arming
+              try {
+                await unlockAudio();
+                unlockSpeech();
+                await speak(alertSpeechScript(alert));
+                announcedRef.current.add(alert.id);
+              } catch {
+                toast.error("Could not read this alert. Tap Play tone & read to retry.");
+                break;
+              }
             }
           }
         } else {
           for (const alert of severe) announcedRef.current.add(alert.id);
-          if (doVoice && !canSpeak()) {
-            toast.error("Text-to-speech is not available in this browser.");
-          }
         }
       } finally {
         setSpeakingId(null);
@@ -357,28 +363,21 @@ export function WeatherJarvisApp() {
   };
 
   const onPlayAlerts = async () => {
-    const ok = await enableMedia();
-    if (!ok && !canSpeak()) {
-      toast.error("Sound and voice are blocked in this browser.");
-      return;
-    }
+    await enableMedia();
     const prefs = kindPrefsRef.current;
     const toPlay = visibleAlerts.filter(
       (a) => isSevere(a) && isKindEnabled(a, prefs),
     );
-    // If nothing "severe", still read the top visible alert
     const list = toPlay.length > 0 ? toPlay : visibleAlerts.slice(0, 1);
     if (list.length === 0) {
       toast.message("No alerts to play right now.");
       return;
     }
-    // Allow re-play
     for (const a of list) announcedRef.current.delete(a.id);
-    toast.message("Playing alert…", { description: "Unmute the tab if you hear nothing." });
     await broadcastAlerts(list, {
       forceSound: soundOn,
       forceVoice: voiceOn,
-      requireMedia: false,
+      fromUser: true,
     });
   };
 
@@ -389,7 +388,7 @@ export function WeatherJarvisApp() {
       try {
         await playAlertSound(soundLevelFor(alert));
       } catch {
-        toast.error("Tone blocked — unmute the tab and tap again.");
+        /* try voice anyway */
       } finally {
         setBroadcastPhase("idle");
       }
@@ -403,9 +402,9 @@ export function WeatherJarvisApp() {
       setSpeakingId(alert.id);
       setBroadcastPhase("voice");
       announcedRef.current.add(alert.id);
-      await speak(alertSpeechScript(alert), { immediate: true });
+      await speak(alertSpeechScript(alert));
     } catch {
-      toast.error("Could not speak alert. Unmute the tab and try again.");
+      toast.error("Could not speak alert — tap Read aloud once more.");
     } finally {
       setSpeakingId(null);
       setBroadcastPhase("idle");
@@ -571,26 +570,18 @@ export function WeatherJarvisApp() {
             </CardDescription>
           </CardHeader>
           <CardContent className="max-h-[520px] space-y-3 overflow-y-auto">
-            {visibleAlerts.length > 0 && (
-              <div
-                className={cn(
-                  "rounded-[var(--radius-lg)] border px-3 py-3",
-                  mediaReady
-                    ? "border-border bg-bg-elevated/50"
-                    : "border-warn/40 bg-warn/10",
-                )}
-              >
+            {visibleAlerts.length > 0 && !mediaReady && (
+              <div className="rounded-[var(--radius-lg)] border border-primary/30 bg-primary/10 px-3 py-3">
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <p className="text-xs leading-relaxed text-muted sm:text-sm">
-                    {mediaReady
-                      ? "Sound is enabled. New high-impact alerts will tone + read when Auto-announce is on."
-                      : "Chrome blocks sound until you tap. Unmute this tab, then press Play (works after one tap)."}
+                    Tap anywhere once to arm alert sound & voice for this visit. After that,
+                    new alerts play on their own when Auto-announce is on.
                   </p>
                   <Button
                     size="sm"
-                    variant={mediaReady ? "secondary" : "warn"}
+                    variant="default"
                     onClick={onPlayAlerts}
-                    disabled={announcing || visibleAlerts.length === 0}
+                    disabled={announcing}
                     className="shrink-0"
                   >
                     {announcing ? (
@@ -598,9 +589,26 @@ export function WeatherJarvisApp() {
                     ) : (
                       <Siren className="h-4 w-4" />
                     )}
-                    {announcing ? "Playing…" : "Play tone & read"}
+                    Arm & play now
                   </Button>
                 </div>
+              </div>
+            )}
+            {visibleAlerts.length > 0 && mediaReady && (
+              <div className="flex justify-end">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={onPlayAlerts}
+                  disabled={announcing}
+                >
+                  {announcing ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Siren className="h-4 w-4" />
+                  )}
+                  Replay alerts
+                </Button>
               </div>
             )}
             {visibleAlerts.length === 0 && (
