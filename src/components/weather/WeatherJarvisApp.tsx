@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   BellRing,
+  ChevronDown,
   Crosshair,
   ExternalLink,
   Loader2,
@@ -14,6 +15,7 @@ import {
   Siren,
   Volume2,
 } from "lucide-react";
+
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -22,16 +24,23 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { DEFAULT_LOCATION, locateUser, searchPlaces } from "@/lib/weather/api";
 import {
+  ALERT_KIND_META,
   alertSpeechScript,
-  demoSevereAlerts,
+  defaultAlertKindPrefs,
   fetchNwsAlerts,
+  isKindEnabled,
   isSevere,
-  mergeAlerts,
+  isWarningEvent,
+  loadAlertKindPrefs,
+  saveAlertKindPrefs,
+  type AlertKindPrefs,
+  type LocationNwsContext,
 } from "@/lib/weather/alerts";
 import {
+  isAudioUnlocked,
   playAckChirp,
   playAlertSound,
-  resumeAudio,
+  unlockAudio,
   stopAlertSounds,
 } from "@/lib/weather/alert-sounds";
 import {
@@ -41,8 +50,14 @@ import {
   type SpcBundle,
   type SpcDayKey,
 } from "@/lib/weather/spc";
-import { canSpeak, speak, stopSpeaking, warmVoices } from "@/lib/weather/speech";
-import type { GeoLocation, WeatherAlert } from "@/lib/weather/types";
+import {
+  canSpeak,
+  speak,
+  stopSpeaking,
+  unlockSpeech,
+  warmVoices,
+} from "@/lib/weather/speech";
+import type { AlertKind, GeoLocation, WeatherAlert } from "@/lib/weather/types";
 import { cn } from "@/lib/utils";
 
 function formatClock(iso: string) {
@@ -59,21 +74,28 @@ function severityVariant(sev: WeatherAlert["severity"]) {
   return "default" as const;
 }
 
-function unlockSpeech(): void {
-  if (!canSpeak()) return;
-  warmVoices();
-  try {
-    const kick = new SpeechSynthesisUtterance(".");
-    kick.volume = 0;
-    kick.rate = 2;
-    window.speechSynthesis.speak(kick);
-  } catch {
-    /* ignore */
+function productKind(event: string): string {
+  if (isWarningEvent(event)) return "WARNING";
+  if (/\bwatch\b/i.test(event)) return "WATCH";
+  if (/\badvisory\b/i.test(event)) return "ADVISORY";
+  return "ALERT";
+}
+
+function kindLabel(kind: AlertKind): string {
+  return ALERT_KIND_META.find((k) => k.id === kind)?.label ?? kind;
+}
+
+function soundLevelFor(alert: WeatherAlert): "moderate" | "severe" | "extreme" {
+  if (alert.severity === "extreme") return "extreme";
+  if (alert.severity === "severe" || isWarningEvent(alert.event) || isSevere(alert)) {
+    return "severe";
   }
+  return "moderate";
 }
 
 export function WeatherJarvisApp() {
   const [location, setLocation] = useState<GeoLocation | null>(null);
+  const [nwsContext, setNwsContext] = useState<LocationNwsContext>({});
   const [spc, setSpc] = useState<SpcBundle | null>(null);
   const [alerts, setAlerts] = useState<WeatherAlert[]>([]);
   const [loading, setLoading] = useState(true);
@@ -84,46 +106,69 @@ export function WeatherJarvisApp() {
   const [voiceOn, setVoiceOn] = useState(true);
   const [soundOn, setSoundOn] = useState(true);
   const [autoRead, setAutoRead] = useState(true);
+  const [kindPrefs, setKindPrefs] = useState<AlertKindPrefs>(() => defaultAlertKindPrefs());
   const [speakingId, setSpeakingId] = useState<string | null>(null);
   const [broadcastPhase, setBroadcastPhase] = useState<"idle" | "tone" | "voice">("idle");
-  const [demoMode, setDemoMode] = useState(false);
   const [announcing, setAnnouncing] = useState(false);
   const [activeDay, setActiveDay] = useState<SpcDayKey>("day1");
   const [activeGraphic, setActiveGraphic] = useState(0);
+  const [kindsOpen, setKindsOpen] = useState(false);
+  const [mediaReady, setMediaReady] = useState(false);
   const announcedRef = useRef<Set<string>>(new Set());
   const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const announceLock = useRef(false);
+  const kindPrefsRef = useRef(kindPrefs);
+  const mediaReadyRef = useRef(false);
 
   useEffect(() => {
     warmVoices();
+    const loaded = loadAlertKindPrefs();
+    setKindPrefs(loaded);
+    kindPrefsRef.current = loaded;
   }, []);
 
+  useEffect(() => {
+    kindPrefsRef.current = kindPrefs;
+    saveAlertKindPrefs(kindPrefs);
+  }, [kindPrefs]);
+
+  /** Must run inside a click/tap — unlocks browser audio + TTS. */
+  const enableMedia = useCallback(async (): Promise<boolean> => {
+    unlockSpeech();
+    warmVoices();
+    const ok = await unlockAudio();
+    mediaReadyRef.current = ok || isAudioUnlocked();
+    setMediaReady(mediaReadyRef.current);
+    if (!mediaReadyRef.current) {
+      toast.error("Could not enable sound. Unmute the tab and try again.");
+    }
+    return mediaReadyRef.current;
+  }, []);
+
+  const visibleAlerts = useMemo(
+    () => alerts.filter((a) => isKindEnabled(a, kindPrefs)),
+    [alerts, kindPrefs],
+  );
+
   const loadForLocation = useCallback(
-    async (loc: GeoLocation, opts?: { demo?: boolean; silent?: boolean }) => {
+    async (loc: GeoLocation, opts?: { silent?: boolean }) => {
       if (!opts?.silent) setLoading(true);
       setError(null);
       try {
         setLocation(loc);
 
-        const [outlooks, nws] = await Promise.all([
+        const [outlooks, nwsResult] = await Promise.all([
           fetchSpcOutlooks(loc.lat, loc.lon),
           fetchNwsAlerts(loc),
         ]);
         setSpc(outlooks);
         setActiveDay("day1");
         setActiveGraphic(0);
-
-        let next = nws;
-        if (opts?.demo) {
-          next = mergeAlerts(demoSevereAlerts(loc), next);
-          setDemoMode(true);
-        } else {
-          setDemoMode(false);
-        }
-        setAlerts(next);
-        return next;
+        setAlerts(nwsResult.alerts);
+        setNwsContext(nwsResult.context);
+        return nwsResult.alerts;
       } catch (e) {
-        const msg = e instanceof Error ? e.message : "Failed to load SPC data";
+        const msg = e instanceof Error ? e.message : "Failed to load weather data";
         setError(msg);
         toast.error(msg);
         return [] as WeatherAlert[];
@@ -135,15 +180,25 @@ export function WeatherJarvisApp() {
   );
 
   const broadcastAlerts = useCallback(
-    async (list: WeatherAlert[], opts?: { forceSound?: boolean; forceVoice?: boolean }) => {
+    async (
+      list: WeatherAlert[],
+      opts?: { forceSound?: boolean; forceVoice?: boolean; requireMedia?: boolean },
+    ) => {
       if (announceLock.current) return;
-      const severe = list.filter(isSevere);
+      const prefs = kindPrefsRef.current;
+      const severe = list.filter((a) => isSevere(a) && isKindEnabled(a, prefs));
       if (severe.length === 0) return;
+
+      // Browsers block tone/voice until a user gesture
+      if (opts?.requireMedia !== false && !mediaReadyRef.current && !isAudioUnlocked()) {
+        return;
+      }
 
       announceLock.current = true;
       setAnnouncing(true);
       try {
-        await resumeAudio();
+        await unlockAudio();
+        unlockSpeech();
         warmVoices();
 
         const doSound = opts?.forceSound ?? soundOn;
@@ -151,20 +206,28 @@ export function WeatherJarvisApp() {
 
         if (doSound) {
           setBroadcastPhase("tone");
-          const top = severe[0]!;
-          await playAlertSound(top.severity === "extreme" ? "extreme" : "severe");
+          try {
+            const top = severe[0]!;
+            await playAlertSound(soundLevelFor(top));
+          } catch (err) {
+            console.warn("[jarvis] tone failed", err);
+            toast.error("Alert tone blocked. Tap “Play tone & read” once to enable sound.");
+            setMediaReady(false);
+            mediaReadyRef.current = false;
+            return;
+          }
         }
 
         if (doVoice && canSpeak()) {
           setBroadcastPhase("voice");
           for (const alert of severe) {
-            announcedRef.current.add(alert.id);
             setSpeakingId(alert.id);
             try {
-              await speak(alertSpeechScript(alert));
+              await speak(alertSpeechScript(alert), { immediate: true });
+              announcedRef.current.add(alert.id);
             } catch (err) {
               console.warn("[jarvis] speech failed", err);
-              toast.error("Could not read alert aloud. Unmute the tab and try Read aloud.");
+              toast.error("Could not read alert. Unmute the tab, then tap Play again.");
               break;
             }
           }
@@ -208,13 +271,18 @@ export function WeatherJarvisApp() {
   }, [loadForLocation]);
 
   useEffect(() => {
-    if (!autoRead || announcing) return;
+    // Only auto-play after media was unlocked by a tap (autoplay policy)
+    if (!autoRead || announcing || !mediaReady) return;
+    const prefs = kindPrefsRef.current;
     const fresh = alerts.filter(
-      (a) => isSevere(a) && a.source !== "demo" && !announcedRef.current.has(a.id),
+      (a) =>
+        isSevere(a) &&
+        isKindEnabled(a, prefs) &&
+        !announcedRef.current.has(a.id),
     );
     if (fresh.length === 0) return;
     void broadcastAlerts(fresh);
-  }, [alerts, autoRead, announcing, broadcastAlerts]);
+  }, [alerts, autoRead, announcing, broadcastAlerts, kindPrefs, mediaReady]);
 
   useEffect(() => {
     if (searchTimer.current) clearTimeout(searchTimer.current);
@@ -233,13 +301,27 @@ export function WeatherJarvisApp() {
   const dayProduct = spc?.days.find((d) => d.key === activeDay) ?? spc?.days[0];
   const graphics = dayProduct?.graphics ?? [];
   const graphic = graphics[Math.min(activeGraphic, Math.max(0, graphics.length - 1))];
+  const alarmCount = visibleAlerts.filter(isSevere).length;
+  const warningCount = visibleAlerts.filter((a) => isWarningEvent(a.event)).length;
+  const officeCount = visibleAlerts.filter((a) => a.scope === "office").length;
+  const nwsOffice = nwsContext.office || alerts.find((a) => a.office)?.office;
+  const kindsOnCount = ALERT_KIND_META.filter((k) => kindPrefs[k.id]).length;
+
+  const setKind = (id: AlertKind, on: boolean) => {
+    setKindPrefs((prev) => ({ ...prev, [id]: on }));
+  };
+
+  const setAllKinds = (on: boolean) => {
+    setKindPrefs(
+      Object.fromEntries(ALERT_KIND_META.map((k) => [k.id, on])) as AlertKindPrefs,
+    );
+  };
 
   const onUseMyLocation = async () => {
     setLocating(true);
     announcedRef.current = new Set();
-    unlockSpeech();
+    await enableMedia();
     try {
-      await resumeAudio();
       const loc = await locateUser();
       await loadForLocation(loc);
       await playAckChirp();
@@ -255,20 +337,49 @@ export function WeatherJarvisApp() {
     setQuery("");
     setSuggestions([]);
     announcedRef.current = new Set();
+    await enableMedia();
     await loadForLocation(loc);
   };
 
+  const onPlayAlerts = async () => {
+    const ok = await enableMedia();
+    if (!ok && !canSpeak()) {
+      toast.error("Sound and voice are blocked in this browser.");
+      return;
+    }
+    const prefs = kindPrefsRef.current;
+    const toPlay = visibleAlerts.filter(
+      (a) => isSevere(a) && isKindEnabled(a, prefs),
+    );
+    // If nothing "severe", still read the top visible alert
+    const list = toPlay.length > 0 ? toPlay : visibleAlerts.slice(0, 1);
+    if (list.length === 0) {
+      toast.message("No alerts to play right now.");
+      return;
+    }
+    // Allow re-play
+    for (const a of list) announcedRef.current.delete(a.id);
+    toast.message("Playing alert…", { description: "Unmute the tab if you hear nothing." });
+    await broadcastAlerts(list, {
+      forceSound: soundOn,
+      forceVoice: voiceOn,
+      requireMedia: false,
+    });
+  };
+
   const onReadAlert = async (alert: WeatherAlert) => {
-    unlockSpeech();
-    await resumeAudio();
-    if (soundOn && isSevere(alert)) {
+    await enableMedia();
+    if (soundOn) {
       setBroadcastPhase("tone");
       try {
-        await playAlertSound(alert.severity === "extreme" ? "extreme" : "severe");
+        await playAlertSound(soundLevelFor(alert));
+      } catch {
+        toast.error("Tone blocked — unmute the tab and tap again.");
       } finally {
         setBroadcastPhase("idle");
       }
     }
+    if (!voiceOn) return;
     if (!canSpeak()) {
       toast.error("Text-to-speech is not available in this browser.");
       return;
@@ -277,7 +388,7 @@ export function WeatherJarvisApp() {
       setSpeakingId(alert.id);
       setBroadcastPhase("voice");
       announcedRef.current.add(alert.id);
-      await speak(alertSpeechScript(alert));
+      await speak(alertSpeechScript(alert), { immediate: true });
     } catch {
       toast.error("Could not speak alert. Unmute the tab and try again.");
     } finally {
@@ -295,34 +406,11 @@ export function WeatherJarvisApp() {
     announceLock.current = false;
   };
 
-  const onDemoSevere = async () => {
-    if (!location || announcing) return;
-    unlockSpeech();
-    await resumeAudio();
-    warmVoices();
-    announcedRef.current = new Set();
-    toast.message("Emergency demo starting", {
-      description: "EAS attention signal, then Jarvis reads the warnings.",
-    });
-    const next = await loadForLocation(location, { demo: true });
-    const demoOnly = next.filter((a) => a.source === "demo" && isSevere(a));
-    await broadcastAlerts(demoOnly, { forceSound: soundOn, forceVoice: voiceOn });
-  };
-
-  const onClearDemo = async () => {
-    if (!location) return;
-    onStopVoice();
-    announcedRef.current = new Set();
-    await loadForLocation(location, { demo: false });
-  };
-
   const onRefresh = async () => {
     if (!location) return;
-    announcedRef.current = new Set(
-      [...announcedRef.current].filter((id) => !id.startsWith("demo-")),
-    );
-    await loadForLocation(location, { demo: demoMode, silent: true });
-    toast.success("SPC outlooks refreshed");
+    announcedRef.current = new Set();
+    await loadForLocation(location, { silent: true });
+    toast.success("Alerts & SPC outlooks refreshed");
   };
 
   return (
@@ -345,8 +433,8 @@ export function WeatherJarvisApp() {
               Weather Jarvis
             </h1>
             <p className="max-w-xl text-sm text-muted">
-              Locates you, shows Storm Prediction Center Day 1–3 outlook graphics,
-              and sounds + reads severe weather alerts.
+              Set your real location once — GPS or city search. We load alerts for your
+              spot, your county, and your NWS office automatically.
             </p>
           </div>
 
@@ -371,72 +459,7 @@ export function WeatherJarvisApp() {
           </div>
         </header>
 
-        {/* Severe alerts first — highest priority */}
-        <Card
-          className={cn(
-            "mb-4 min-w-0",
-            alerts.some(isSevere) && "border-danger/40 alert-pulse",
-          )}
-        >
-          <CardHeader>
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <AlertTriangle
-                  className={cn(
-                    "h-5 w-5 shrink-0",
-                    alerts.some(isSevere) ? "text-danger" : "text-muted",
-                  )}
-                />
-                <CardTitle>Severe weather alerts</CardTitle>
-              </div>
-              <Badge variant={alerts.some(isSevere) ? "danger" : "default"}>
-                {alerts.length} active
-              </Badge>
-            </div>
-            <CardDescription>
-              Live NWS warnings for your point. Severe alerts trigger alarm + voice when
-              enabled.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="max-h-[420px] space-y-3 overflow-y-auto">
-            {alerts.length === 0 && (
-              <div className="rounded-[var(--radius-lg)] border border-border bg-bg-elevated/60 px-4 py-6 text-center text-sm text-muted">
-                No active NWS alerts at this location. Use Demo severe to test alarm + voice.
-              </div>
-            )}
-            {alerts.map((alert) => (
-              <div
-                key={alert.id}
-                className={cn(
-                  "rounded-[var(--radius-lg)] border border-border bg-bg-elevated/70 p-3",
-                  isSevere(alert) && "border-danger/35 bg-danger/5",
-                )}
-              >
-                <div className="mb-2 flex flex-wrap items-center gap-2">
-                  <Badge variant={severityVariant(alert.severity)}>{alert.severity}</Badge>
-                  <Badge variant="default">{alert.source.toUpperCase()}</Badge>
-                  {speakingId === alert.id && <Badge variant="primary">Speaking…</Badge>}
-                </div>
-                <p className="text-sm font-semibold text-fg">{alert.event}</p>
-                <p className="mt-1 line-clamp-3 text-xs leading-relaxed text-muted">
-                  {alert.headline}
-                </p>
-                <div className="mt-3">
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    onClick={() => onReadAlert(alert)}
-                    disabled={announcing}
-                  >
-                    <Volume2 className="h-3.5 w-3.5" />
-                    Read aloud
-                  </Button>
-                </div>
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-
+        {/* Location first — this is how alerts are scoped */}
         <Card className="mb-4 min-w-0 overflow-visible">
           <CardContent className="space-y-3 p-4 sm:p-5">
             <label className="text-xs font-medium uppercase tracking-wide text-muted">
@@ -447,7 +470,7 @@ export function WeatherJarvisApp() {
               <Input
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Search city if location is blocked…"
+                placeholder='Your city — e.g. "Quincy, FL" or "Marianna, FL"'
                 className="pl-10"
                 aria-label="Search location"
               />
@@ -470,16 +493,240 @@ export function WeatherJarvisApp() {
             </div>
             <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
               <MapPin className="h-4 w-4 shrink-0 text-primary" />
-              <span className="truncate">
+              <span className="truncate font-medium text-fg">
                 {location?.label ?? (loading ? "Locating…" : "No location yet")}
               </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              {nwsContext.countyName && (
+                <Badge variant="ok">County: {nwsContext.countyName}</Badge>
+              )}
+              {nwsOffice && <Badge variant="primary">NWS {nwsOffice}</Badge>}
               {spc && (
                 <Badge variant={riskBadgeVariant(spc.maxRisk.label)}>
-                  Your area (D1–3 max): {spc.maxRisk.label2}
+                  SPC D1–3: {spc.maxRisk.label2}
                 </Badge>
               )}
             </div>
+            <p className="text-xs text-subtle">
+              Tip: tap <strong className="text-muted">Use my location</strong> (allow GPS) or
+              search <strong className="text-muted">City, ST</strong> so we don’t pick a
+              same-named city in another state.
+            </p>
           </CardContent>
+        </Card>
+
+        <Card
+          className={cn("mb-4 min-w-0", alarmCount > 0 && "border-danger/40 alert-pulse")}
+        >
+          <CardHeader>
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <AlertTriangle
+                  className={cn(
+                    "h-5 w-5 shrink-0",
+                    alarmCount > 0 ? "text-danger" : "text-muted",
+                  )}
+                />
+                <CardTitle>Weather alerts</CardTitle>
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                {warningCount > 0 && (
+                  <Badge variant="danger">
+                    {warningCount} warning{warningCount === 1 ? "" : "s"}
+                  </Badge>
+                )}
+                {officeCount > 0 && (
+                  <Badge variant="warn">{officeCount} nearby</Badge>
+                )}
+                <Badge variant={alarmCount > 0 ? "danger" : "default"}>
+                  {visibleAlerts.length} shown
+                </Badge>
+              </div>
+            </div>
+            <CardDescription>
+              For <span className="text-fg">{location?.city || "your location"}</span>
+              {nwsContext.countyName ? (
+                <>
+                  {" "}
+                  · county <span className="text-fg">{nwsContext.countyName}</span>
+                </>
+              ) : null}
+              . “Your area” = you or your county. “Nearby” = same NWS office, other counties.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="max-h-[520px] space-y-3 overflow-y-auto">
+            {visibleAlerts.length > 0 && (
+              <div
+                className={cn(
+                  "rounded-[var(--radius-lg)] border px-3 py-3",
+                  mediaReady
+                    ? "border-border bg-bg-elevated/50"
+                    : "border-warn/40 bg-warn/10",
+                )}
+              >
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-xs leading-relaxed text-muted sm:text-sm">
+                    {mediaReady
+                      ? "Sound is enabled. New high-impact alerts will tone + read when Auto-announce is on."
+                      : "Browsers block alarm sound until you tap. Unmute the tab, then press Play."}
+                  </p>
+                  <Button
+                    size="sm"
+                    variant={mediaReady ? "secondary" : "warn"}
+                    onClick={onPlayAlerts}
+                    disabled={announcing || visibleAlerts.length === 0}
+                    className="shrink-0"
+                  >
+                    {announcing ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Siren className="h-4 w-4" />
+                    )}
+                    {announcing ? "Playing…" : "Play tone & read"}
+                  </Button>
+                </div>
+              </div>
+            )}
+            {visibleAlerts.length === 0 && (
+              <div className="rounded-[var(--radius-lg)] border border-border bg-bg-elevated/60 px-4 py-6 text-center text-sm text-muted">
+                {alerts.length > 0
+                  ? "Alerts are hidden by your type toggles below. Turn some kinds back on."
+                  : "No active NWS alerts for this location or county. Confirm the city/state above, or try Use my location."}
+              </div>
+            )}
+            {visibleAlerts.map((alert) => (
+              <div
+                key={alert.id}
+                className={cn(
+                  "rounded-[var(--radius-lg)] border border-border bg-bg-elevated/70 p-3",
+                  isSevere(alert) && "border-danger/35 bg-danger/5",
+                  isWarningEvent(alert.event) && "border-l-4 border-l-danger",
+                )}
+              >
+                <div className="mb-2 flex flex-wrap items-center gap-2">
+                  <Badge variant={severityVariant(alert.severity)}>{alert.severity}</Badge>
+                  <Badge
+                    variant={
+                      productKind(alert.event) === "WARNING"
+                        ? "danger"
+                        : productKind(alert.event) === "WATCH"
+                          ? "warn"
+                          : "default"
+                    }
+                  >
+                    {productKind(alert.event)}
+                  </Badge>
+                  <Badge variant="default">{kindLabel(alert.kind)}</Badge>
+                  <Badge variant={alert.scope === "local" ? "ok" : "warn"}>
+                    {alert.scope === "local"
+                      ? "Your area"
+                      : `Nearby · NWS ${alert.office || ""}`}
+                  </Badge>
+                  {speakingId === alert.id && <Badge variant="primary">Speaking…</Badge>}
+                </div>
+                <p className="text-sm font-semibold text-fg">{alert.event}</p>
+                <p className="mt-1 line-clamp-3 text-xs leading-relaxed text-muted">
+                  {alert.headline}
+                </p>
+                {alert.area && (
+                  <p className="mt-1 line-clamp-2 text-[11px] text-subtle">{alert.area}</p>
+                )}
+                <div className="mt-3">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => onReadAlert(alert)}
+                    disabled={announcing}
+                  >
+                    <Volume2 className="h-3.5 w-3.5" />
+                    Read aloud
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 min-w-0">
+          <button
+            type="button"
+            className="flex w-full items-start justify-between gap-3 p-4 text-left sm:p-5 sm:pb-4"
+            onClick={() => setKindsOpen((o) => !o)}
+            aria-expanded={kindsOpen}
+            aria-controls="alert-types-panel"
+          >
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <CardTitle className="text-base">Alert types</CardTitle>
+                <Badge variant="default">
+                  {kindsOnCount}/{ALERT_KIND_META.length} on
+                </Badge>
+              </div>
+              <CardDescription className="mt-1">
+                {kindsOpen
+                  ? "Choose what to show and what can sound / auto-announce"
+                  : "Tap to expand filters for tornado, storm, flood, heat, fire…"}
+              </CardDescription>
+            </div>
+            <ChevronDown
+              className={cn(
+                "mt-0.5 h-5 w-5 shrink-0 text-muted transition-transform duration-200",
+                kindsOpen && "rotate-180",
+              )}
+              aria-hidden
+            />
+          </button>
+
+          {kindsOpen && (
+            <CardContent id="alert-types-panel" className="space-y-3 pt-0">
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setAllKinds(true);
+                  }}
+                >
+                  All on
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setAllKinds(false);
+                  }}
+                >
+                  All off
+                </Button>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {ALERT_KIND_META.map((k) => (
+                  <label
+                    key={k.id}
+                    className={cn(
+                      "flex cursor-pointer items-center justify-between gap-3 rounded-[var(--radius-md)] border px-3 py-2.5",
+                      kindPrefs[k.id]
+                        ? "border-primary/30 bg-primary/5"
+                        : "border-border bg-bg-elevated/40 opacity-70",
+                    )}
+                  >
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-fg">{k.label}</p>
+                      <p className="text-[11px] text-muted">{k.blurb}</p>
+                    </div>
+                    <Switch
+                      checked={kindPrefs[k.id]}
+                      onCheckedChange={(v) => setKind(k.id, v)}
+                      aria-label={`Toggle ${k.label} alerts`}
+                    />
+                  </label>
+                ))}
+              </div>
+            </CardContent>
+          )}
         </Card>
 
         <Card className="mb-6 min-w-0">
@@ -509,7 +756,7 @@ export function WeatherJarvisApp() {
             <ToggleRow
               icon={<Volume2 className="h-4 w-4 text-muted" />}
               title="Auto-announce"
-              desc="On new severe alerts"
+              desc="Enabled types only"
               checked={autoRead}
               onCheckedChange={setAutoRead}
               ariaLabel="Toggle auto announce"
@@ -523,31 +770,13 @@ export function WeatherJarvisApp() {
               </div>
             )}
 
-            <div className="flex flex-wrap gap-2 sm:col-span-3">
-              <Button
-                variant="warn"
-                size="sm"
-                onClick={onDemoSevere}
-                disabled={!location || announcing}
-              >
-                {announcing ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Siren className="h-4 w-4" />
-                )}
-                Demo severe
-              </Button>
-              {demoMode && (
-                <Button variant="ghost" size="sm" onClick={onClearDemo}>
-                  Clear demo
-                </Button>
-              )}
-              {(speakingId || broadcastPhase !== "idle") && (
+            {(speakingId || broadcastPhase !== "idle") && (
+              <div className="flex flex-wrap gap-2 sm:col-span-3">
                 <Button variant="outline" size="sm" onClick={onStopVoice}>
                   Stop broadcast
                 </Button>
-              )}
-            </div>
+              </div>
+            )}
           </CardContent>
         </Card>
 

@@ -1,21 +1,61 @@
 /**
  * NOAA / EAS-style weather alert tones via Web Audio API.
  * Classic attention signal: simultaneous 853 Hz + 960 Hz.
+ *
+ * Browsers keep AudioContext suspended until a user gesture — call
+ * unlockAudio() / resumeAudio() from a click before expecting sound.
  */
 
 let sharedCtx: AudioContext | null = null;
 let activeNodes: AudioNode[] = [];
+let unlocked = false;
 
 function getCtx(): AudioContext {
   if (!sharedCtx) {
-    sharedCtx = new AudioContext();
+    const AC =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AC) throw new Error("Web Audio is not supported in this browser");
+    sharedCtx = new AC();
   }
   return sharedCtx;
 }
 
+export function isAudioUnlocked(): boolean {
+  return unlocked && !!sharedCtx && sharedCtx.state === "running";
+}
+
+/** Call from a click/tap. Returns true if audio can play. */
+export async function unlockAudio(): Promise<boolean> {
+  try {
+    const ctx = getCtx();
+    if (ctx.state === "suspended") {
+      await ctx.resume();
+    }
+    // Silent buffer kick — some mobile browsers need a real play() in the gesture
+    const buffer = ctx.createBuffer(1, 1, 22050);
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+    src.start(0);
+    unlocked = ctx.state === "running";
+    return unlocked;
+  } catch {
+    unlocked = false;
+    return false;
+  }
+}
+
 export async function resumeAudio(): Promise<AudioContext> {
   const ctx = getCtx();
-  if (ctx.state === "suspended") await ctx.resume();
+  if (ctx.state === "suspended") {
+    try {
+      await ctx.resume();
+    } catch {
+      /* still suspended without gesture */
+    }
+  }
+  if (ctx.state === "running") unlocked = true;
   return ctx;
 }
 
@@ -60,7 +100,6 @@ function playEasAttention(
     const osc = track(ctx.createOscillator());
     osc.type = "sine";
     osc.frequency.setValueAtTime(freq, start);
-    // Slight detune per oscillator for a fuller radio feel
     osc.detune.setValueAtTime(freq === 853 ? -2 : 2, start);
     osc.connect(master);
     osc.start(start);
@@ -70,7 +109,6 @@ function playEasAttention(
 
 /** Short SAME-style digital header chirps before the attention signal. */
 function playSamePreamble(ctx: AudioContext, start: number): number {
-  // Three short data-burst-like multi-tone packets (stylized, not real SAME)
   let t = start;
   for (let packet = 0; packet < 3; packet++) {
     const packetGain = track(ctx.createGain());
@@ -79,7 +117,6 @@ function playSamePreamble(ctx: AudioContext, start: number): number {
     packetGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
     packetGain.connect(ctx.destination);
 
-    // Rapid FSK-ish blips
     const freqs = [1562.5, 2083.3, 1562.5, 2083.3, 1562.5, 2083.3];
     freqs.forEach((freq, i) => {
       const osc = track(ctx.createOscillator());
@@ -95,7 +132,6 @@ function playSamePreamble(ctx: AudioContext, start: number): number {
       osc.stop(s + 0.03);
     });
     t += 0.22;
-    // Inter-packet gap (~1s on real SAME; shortened for UX)
     t += packet < 2 ? 0.35 : 0.15;
   }
   return t;
@@ -129,21 +165,23 @@ export type AlertSoundLevel = "minor" | "moderate" | "severe" | "extreme";
  */
 export async function playAlertSound(level: AlertSoundLevel = "severe"): Promise<void> {
   stopAlertSounds();
-  const ctx = await resumeAudio();
+  const ok = await unlockAudio();
+  const ctx = getCtx();
+  if (!ok && ctx.state !== "running") {
+    throw new Error("Audio blocked — tap the page once to enable sound");
+  }
+
   const t0 = ctx.currentTime + 0.03;
   let end = t0;
 
   if (level === "minor" || level === "moderate") {
-    // Short dual-tone chime (not full EAS)
     playEasAttention(ctx, t0, 1.4, 0.1);
     end = t0 + 1.5;
   } else if (level === "severe") {
-    // SAME preamble → ~6s EAS attention → NWR beeps
     const afterPreamble = playSamePreamble(ctx, t0);
     playEasAttention(ctx, afterPreamble, 6.0, 0.17);
     end = playNwrBeeps(ctx, afterPreamble + 6.15, 3);
   } else {
-    // Extreme: longer EAS + more beeps
     const afterPreamble = playSamePreamble(ctx, t0);
     playEasAttention(ctx, afterPreamble, 8.0, 0.19);
     end = playNwrBeeps(ctx, afterPreamble + 8.2, 5);
@@ -154,7 +192,10 @@ export async function playAlertSound(level: AlertSoundLevel = "severe"): Promise
 }
 
 export async function playAckChirp(): Promise<void> {
-  const ctx = await resumeAudio();
+  const ok = await unlockAudio();
+  const ctx = getCtx();
+  if (!ok && ctx.state !== "running") return;
+
   const t0 = ctx.currentTime + 0.01;
   const osc1 = track(ctx.createOscillator());
   const osc2 = track(ctx.createOscillator());

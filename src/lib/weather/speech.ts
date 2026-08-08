@@ -2,13 +2,43 @@ export type SpeakOptions = {
   rate?: number;
   pitch?: number;
   volume?: number;
+  /** Skip cancel delay when already inside a user gesture */
+  immediate?: boolean;
 };
 
 let currentUtterance: SpeechSynthesisUtterance | null = null;
 let speakChain: Promise<void> = Promise.resolve();
+let speechUnlocked = false;
 
 export function canSpeak(): boolean {
   return typeof window !== "undefined" && "speechSynthesis" in window;
+}
+
+export function isSpeechUnlocked(): boolean {
+  return speechUnlocked;
+}
+
+/**
+ * Prime TTS from a user tap. Browsers often block speech until a gesture.
+ */
+export function unlockSpeech(): boolean {
+  if (!canSpeak()) return false;
+  warmVoices();
+  try {
+    // Silent kick — marks speech as user-activated in Chrome/Safari
+    window.speechSynthesis.cancel();
+    const kick = new SpeechSynthesisUtterance(" ");
+    kick.volume = 0.01;
+    kick.rate = 2;
+    kick.lang = "en-US";
+    window.speechSynthesis.speak(kick);
+    window.speechSynthesis.cancel();
+    speechUnlocked = true;
+    return true;
+  } catch {
+    speechUnlocked = false;
+    return false;
+  }
 }
 
 export function stopSpeaking() {
@@ -19,6 +49,39 @@ export function stopSpeaking() {
     /* ignore */
   }
   currentUtterance = null;
+}
+
+/**
+ * Strip NWS / bulletin punctuation that TTS reads literally
+ * (asterisk, ellipsis dots, ALL-CAPS section tags, etc.).
+ */
+export function sanitizeForSpeech(raw: string): string {
+  let t = raw;
+
+  t = t.replace(/\r\n/g, "\n");
+  t = t.replace(/^\s*[\*\-•▪◦●]\s*/gm, "");
+  t = t.replace(/(^|\s)\*+(?=\s|$)/g, " ");
+  t = t.replace(/\*+/g, " ");
+
+  t = t.replace(/\.{3,}/g, ". ");
+  t = t.replace(/\u2026/g, ". ");
+  t = t.replace(/_{2,}/g, " ");
+  t = t.replace(/={2,}/g, " ");
+  t = t.replace(/#{1,}/g, " ");
+  t = t.replace(/~{1,}/g, " ");
+  t = t.replace(/\|/g, ", ");
+  t = t.replace(/[/\\]/g, " ");
+
+  t = t.replace(/\[[^\]]*]/g, " ");
+  t = t.replace(/\b(HAZARD|SOURCE|IMPACT|PRECAUTIONARY\/PREPAREDNESS ACTIONS)\s*\.+/gi, "$1: ");
+
+  t = t.replace(/\s+/g, " ");
+  t = t.replace(/\s+([,.;:!?])/g, "$1");
+  t = t.replace(/([,.;:!?]){2,}/g, "$1");
+  t = t.replace(/\s+'/g, "'");
+  t = t.trim();
+
+  return t;
 }
 
 function pickVoice(): SpeechSynthesisVoice | null {
@@ -54,7 +117,6 @@ function speakOnce(text: string, opts: SpeakOptions): Promise<void> {
       return;
     }
 
-    // Chrome sometimes ignores speak() if a prior cancel is mid-flight
     try {
       window.speechSynthesis.cancel();
     } catch {
@@ -62,7 +124,13 @@ function speakOnce(text: string, opts: SpeakOptions): Promise<void> {
     }
 
     const run = () => {
-      const utterance = new SpeechSynthesisUtterance(text);
+      const clean = sanitizeForSpeech(text);
+      if (!clean) {
+        resolve();
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(clean);
       utterance.rate = opts.rate ?? 0.92;
       utterance.pitch = opts.pitch ?? 0.95;
       utterance.volume = opts.volume ?? 1;
@@ -82,13 +150,13 @@ function speakOnce(text: string, opts: SpeakOptions): Promise<void> {
 
       utterance.onend = () => finish();
       utterance.onerror = (e) => {
-        // "interrupted" / "canceled" when we intentionally stop — treat as soft end
         const err = String(e.error ?? "");
         if (err === "interrupted" || err === "canceled") finish();
         else finish(new Error(err || "speech error"));
       };
 
       currentUtterance = utterance;
+      speechUnlocked = true;
 
       try {
         window.speechSynthesis.resume();
@@ -97,7 +165,7 @@ function speakOnce(text: string, opts: SpeakOptions): Promise<void> {
       }
       window.speechSynthesis.speak(utterance);
 
-      // Chrome bug: utterance can stall; watchdog if speaking never starts
+      // Chrome can stall; nudge if never starts
       window.setTimeout(() => {
         if (!settled && currentUtterance === utterance && !window.speechSynthesis.speaking) {
           try {
@@ -107,24 +175,30 @@ function speakOnce(text: string, opts: SpeakOptions): Promise<void> {
             /* ignore */
           }
         }
-      }, 250);
+      }, 300);
+
+      // Watchdog: if still silent after 2s, surface error
+      window.setTimeout(() => {
+        if (!settled && currentUtterance === utterance && !window.speechSynthesis.speaking) {
+          finish(new Error("Speech did not start — unmute the tab and tap Play again"));
+        }
+      }, 2000);
     };
 
-    // Small delay after cancel so Chrome accepts the next utterance
-    window.setTimeout(run, 60);
+    // Immediate path keeps user-gesture activation on mobile
+    if (opts.immediate) {
+      run();
+    } else {
+      window.setTimeout(run, 40);
+    }
   });
 }
 
-/**
- * Queue-safe speak. Call this from a user gesture when possible.
- * Awaits voice list first for more reliable first utterance.
- */
 export async function speak(text: string, opts: SpeakOptions = {}): Promise<void> {
   if (!canSpeak()) throw new Error("Speech not supported");
   await waitForVoices();
 
   const job = speakChain.then(() => speakOnce(text, opts)).catch((err) => {
-    // Don't break the chain forever
     throw err;
   });
   speakChain = job.then(
@@ -134,7 +208,6 @@ export async function speak(text: string, opts: SpeakOptions = {}): Promise<void
   return job;
 }
 
-/** Speak several scripts in order (e.g. multiple alerts). */
 export async function speakSequence(
   scripts: string[],
   opts: SpeakOptions = {},
@@ -150,7 +223,6 @@ export function isSpeaking(): boolean {
   return canSpeak() && window.speechSynthesis.speaking;
 }
 
-/** Warm up voices list (Chrome loads async). Call on first user gesture too. */
 export function warmVoices() {
   if (!canSpeak()) return;
   window.speechSynthesis.getVoices();
