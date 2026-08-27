@@ -1,0 +1,8 @@
+{
+  "title": "Weather Jarvis — SPC outlooks & severe weather alerts",
+  "description": "Geolocation weather assistant with Storm Prediction Center Day 1–3 graphics, severe alert alarms, and spoken warnings.",
+  "card": "custom",
+  "image": "/og.jpg",
+  "banner": "/x-banner.jpg",
+  "color": "7eb6ff"
+}
