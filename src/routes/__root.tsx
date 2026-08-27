@@ -23,28 +23,13 @@ function publicShareHost(raw: string): string {
   return host;
 }
 
-async function resolveShareHost(): Promise<string> {
-  const fromEnv = publicShareHost(
-    typeof process !== "undefined" ? String(process.env?.VITE_PUBLIC_HOSTNAME ?? "") : "",
-  );
-  if (fromEnv) return fromEnv;
-  try {
-    const { getRequest } = await import("@tanstack/react-start/server");
-    const req = getRequest();
-    const forwarded = req.headers.get("x-forwarded-host") || req.headers.get("host") || "";
-    return publicShareHost(forwarded);
-  } catch {
-    return "";
-  }
+function shareHost(): string {
+  return publicShareHost(String(import.meta.env.VITE_PUBLIC_HOSTNAME ?? ""));
 }
 
 export const Route = createRootRoute({
-  loader: async () => {
-    const host = await resolveShareHost();
-    return { host };
-  },
-  head: ({ loaderData }) => {
-    const host = loaderData?.host ?? "";
+  head: () => {
+    const host = shareHost();
     const ogImage = host ? `https://${host}/og.jpg` : undefined;
     const xBanner = host ? `https://${host}/x-banner.jpg` : undefined;
     return {
